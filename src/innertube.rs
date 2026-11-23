@@ -386,3 +386,43 @@ fn parse_duration_seconds(dur_str: &str) -> u32 {
     }
     secs
 }
+
+static STREAM_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+fn get_stream_agent() -> &'static ureq::Agent {
+    STREAM_AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(12))
+            .build()
+    })
+}
+
+pub fn fetch_range(url: &str, start: u64, end: u64) -> Result<(Vec<u8>, u64), String> {
+    use std::io::Read;
+
+    let range_header = format!("bytes={}-{}", start, end);
+    let agent = get_stream_agent();
+
+    let resp = agent
+        .get(url)
+        .set("User-Agent", "com.google.ios.youtube/21.03.2 (iPhone16,2; U; CPU iOS 18_7_2 like Mac OS X; en_US)")
+        .set("Range", &range_header)
+        .call()
+        .map_err(|e| format!("HTTP Range request failed: {}", e))?;
+
+    let mut total_size = 0u64;
+    if let Some(cr) = resp.header("Content-Range") {
+        if let Some(slash_pos) = cr.rfind('/') {
+            let total_str = &cr[slash_pos + 1..];
+            total_size = total_str.trim().parse::<u64>().unwrap_or(0);
+        }
+    }
+
+    let mut buf = Vec::new();
+    let mut reader = resp.into_reader();
+    reader
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("Failed to read stream response bytes: {}", e))?;
+
+    Ok((buf, total_size))
+}

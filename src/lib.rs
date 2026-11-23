@@ -62,6 +62,35 @@ pub extern "C" fn ytpipe_get_video_info(
     out_stream_url: *mut c_char,
     out_url_max: usize,
 ) -> i32 {
+    ytpipe_get_video_info_ex(
+        video_id,
+        out_title,
+        out_title_max,
+        out_channel,
+        out_channel_max,
+        out_duration_seconds,
+        out_stream_url,
+        out_url_max,
+        std::ptr::null_mut(),
+        0,
+    )
+}
+
+/// Retrieves metadata, stream URL, and MIME content type for a video ID.
+/// Returns 1 on success, 0 on failure.
+#[no_mangle]
+pub extern "C" fn ytpipe_get_video_info_ex(
+    video_id: *const c_char,
+    out_title: *mut c_char,
+    out_title_max: usize,
+    out_channel: *mut c_char,
+    out_channel_max: usize,
+    out_duration_seconds: *mut i32,
+    out_stream_url: *mut c_char,
+    out_url_max: usize,
+    out_mime_type: *mut c_char,
+    out_mime_max: usize,
+) -> i32 {
     if video_id.is_null() {
         return 0;
     }
@@ -87,11 +116,50 @@ pub extern "C" fn ytpipe_get_video_info(
                 }
             }
             copy_to_c_buf(&info.stream_url, out_stream_url, out_url_max);
+            copy_to_c_buf(&info.mime_type, out_mime_type, out_mime_max);
             1
         }
         Err(e) => {
             eprintln!("[ytpipe_core] Error fetching video info: {}", e);
             0
+        }
+    }
+}
+
+/// Fetches a byte range chunk from a stream URL.
+/// Returns bytes read into out_buf, or -1 on error.
+#[no_mangle]
+pub extern "C" fn ytpipe_fetch_range(
+    stream_url: *const c_char,
+    start_byte: u64,
+    end_byte: u64,
+    out_buf: *mut u8,
+    buf_capacity: usize,
+    out_total_size: *mut u64,
+) -> i64 {
+    if stream_url.is_null() || out_buf.is_null() || buf_capacity == 0 {
+        return -1;
+    }
+    let c_str = unsafe { CStr::from_ptr(stream_url) };
+    let url_str = match c_str.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+
+    match innertube::fetch_range(url_str, start_byte, end_byte) {
+        Ok((bytes, total_size)) => {
+            let to_copy = bytes.len().min(buf_capacity);
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, to_copy);
+                if !out_total_size.is_null() && total_size > 0 {
+                    *out_total_size = total_size;
+                }
+            }
+            to_copy as i64
+        }
+        Err(e) => {
+            eprintln!("[ytpipe_core] fetch_range error: {}", e);
+            -1
         }
     }
 }
