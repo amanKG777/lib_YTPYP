@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const API_KEY: &str = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
-const PLAYER_URL: &str = "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+const IOS_PLAYER_URL: &str = "https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false";
+const ANDROID_VR_PLAYER_URL: &str = "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 const SEARCH_URL: &str = "https://www.youtube.com/youtubei/v1/search?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 
 #[derive(Debug, Clone)]
@@ -115,6 +115,81 @@ pub fn get_video_info(video_id: &str) -> Result<VideoInfo, String> {
         }
     }
 
+    // 1. Try Primary: IOS client (returns unthrottled direct audio URLs without signature cipher)
+    match fetch_via_ios(video_id) {
+        Ok(info) => {
+            let mut cache = get_cache().lock().unwrap();
+            cache.insert(
+                video_id.to_string(),
+                CacheEntry {
+                    info: info.clone(),
+                    fetched_at: Instant::now(),
+                },
+            );
+            return Ok(info);
+        }
+        Err(e) => {
+            eprintln!("[ytpipe_core] IOS client failed for {}: {}", video_id, e);
+        }
+    }
+
+    // 2. Fallback: ANDROID_VR client
+    match fetch_via_android_vr(video_id) {
+        Ok(info) => {
+            let mut cache = get_cache().lock().unwrap();
+            cache.insert(
+                video_id.to_string(),
+                CacheEntry {
+                    info: info.clone(),
+                    fetched_at: Instant::now(),
+                },
+            );
+            return Ok(info);
+        }
+        Err(e) => {
+            eprintln!("[ytpipe_core] ANDROID_VR fallback failed for {}: {}", video_id, e);
+            Err(format!("Failed to retrieve playable audio for video {}: {}", video_id, e))
+        }
+    }
+}
+
+fn fetch_via_ios(video_id: &str) -> Result<VideoInfo, String> {
+    let payload = serde_json::json!({
+        "context": {
+            "client": {
+                "clientName": "IOS",
+                "clientVersion": "21.03.2",
+                "deviceMake": "Apple",
+                "deviceModel": "iPhone16,2",
+                "osName": "iOS",
+                "osVersion": "18.7.2.22H124",
+                "hl": "en",
+                "gl": "US"
+            }
+        },
+        "videoId": video_id
+    });
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(12))
+        .build();
+
+    let resp = agent
+        .post(IOS_PLAYER_URL)
+        .set("Content-Type", "application/json")
+        .set("User-Agent", "com.google.ios.youtube/21.03.2 (iPhone16,2; U; CPU iOS 18_7_2 like Mac OS X; en_US)")
+        .set("X-Goog-Api-Format-Version", "2")
+        .send_json(payload)
+        .map_err(|e| format!("IOS HTTP request failed: {}", e))?;
+
+    let json: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
+
+    parse_player_response(video_id, &json)
+}
+
+fn fetch_via_android_vr(video_id: &str) -> Result<VideoInfo, String> {
     let payload = serde_json::json!({
         "context": {
             "client": {
@@ -128,20 +203,24 @@ pub fn get_video_info(video_id: &str) -> Result<VideoInfo, String> {
     });
 
     let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(12))
         .build();
 
     let resp = agent
-        .post(PLAYER_URL)
+        .post(ANDROID_VR_PLAYER_URL)
         .set("Content-Type", "application/json")
         .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
         .send_json(payload)
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
+        .map_err(|e| format!("ANDROID_VR HTTP request failed: {}", e))?;
 
     let json: serde_json::Value = resp
         .into_json()
         .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
 
+    parse_player_response(video_id, &json)
+}
+
+fn parse_player_response(video_id: &str, json: &serde_json::Value) -> Result<VideoInfo, String> {
     let status = json["playabilityStatus"]["status"]
         .as_str()
         .unwrap_or("UNKNOWN");
@@ -167,8 +246,7 @@ pub fn get_video_info(video_id: &str) -> Result<VideoInfo, String> {
         .unwrap_or(&empty_vec);
 
     // Pick best audio format:
-    // 1. itag 140 (m4a aac ~128kbps) or itag 251 (webm opus ~160kbps)
-    // 2. Highest bitrate audio with direct url
+    // Prioritize high-bitrate Opus (itag 251 ~160-174kbps) or AAC (itag 140 ~128kbps)
     let mut selected_format: Option<&serde_json::Value> = None;
     let mut best_bitrate = 0u64;
 
@@ -181,48 +259,36 @@ pub fn get_video_info(video_id: &str) -> Result<VideoInfo, String> {
             continue;
         }
 
-        let itag = f["itag"].as_u64().unwrap_or(0);
         let bitrate = f["bitrate"].as_u64().unwrap_or(0);
-
-        // Preference for itag 140 (AAC) or itag 251 (Opus)
-        if itag == 140 {
-            selected_format = Some(f);
-            break;
-        } else if itag == 251 && (selected_format.is_none() || best_bitrate < bitrate) {
-            selected_format = Some(f);
-            best_bitrate = bitrate;
-        } else if selected_format.is_none() || bitrate > best_bitrate {
+        if selected_format.is_none() || bitrate > best_bitrate {
             selected_format = Some(f);
             best_bitrate = bitrate;
         }
     }
 
     let fmt = selected_format.ok_or_else(|| "No direct playable audio streams found in response".to_string())?;
-    let stream_url = fmt["url"].as_str().unwrap().to_string();
-    let mime_type = fmt["mimeType"].as_str().unwrap_or("audio/mp4").to_string();
+    let mut raw_url = fmt["url"].as_str().unwrap().to_string();
+    let mime_type = fmt["mimeType"].as_str().unwrap_or("audio/webm").to_string();
 
-    let info = VideoInfo {
+    // Append extension query parameter so foobar2000's input manager instantly recognizes the format
+    if mime_type.contains("webm") || mime_type.contains("opus") {
+        if !raw_url.contains("&file=") {
+            raw_url.push_str("&file=audio.webm");
+        }
+    } else if mime_type.contains("mp4") || mime_type.contains("m4a") || mime_type.contains("aac") {
+        if !raw_url.contains("&file=") {
+            raw_url.push_str("&file=audio.m4a");
+        }
+    }
+
+    Ok(VideoInfo {
         id: video_id.to_string(),
         title,
         channel,
         duration_seconds: duration_sec,
-        stream_url,
+        stream_url: raw_url,
         mime_type,
-    };
-
-    // Store in cache
-    {
-        let mut cache = get_cache().lock().unwrap();
-        cache.insert(
-            video_id.to_string(),
-            CacheEntry {
-                info: info.clone(),
-                fetched_at: Instant::now(),
-            },
-        );
-    }
-
-    Ok(info)
+    })
 }
 
 pub fn search(query: &str, max_results: usize) -> Result<Vec<SearchItem>, String> {
