@@ -115,7 +115,25 @@ pub fn get_video_info(video_id: &str) -> Result<VideoInfo, String> {
         }
     }
 
-    // 1. Try Primary: IOS client (returns unthrottled direct audio URLs without signature cipher)
+    // 1. Try Primary: VISIONOS client with session visitorData and CPN (FukeX / NewPipe method)
+    match fetch_via_visionos(video_id) {
+        Ok(info) => {
+            let mut cache = get_cache().lock().unwrap();
+            cache.insert(
+                video_id.to_string(),
+                CacheEntry {
+                    info: info.clone(),
+                    fetched_at: Instant::now(),
+                },
+            );
+            return Ok(info);
+        }
+        Err(e) => {
+            eprintln!("[ytpipe_core] VISIONOS client failed for {}: {}", video_id, e);
+        }
+    }
+
+    // 2. Fallback: IOS client
     match fetch_via_ios(video_id) {
         Ok(info) => {
             let mut cache = get_cache().lock().unwrap();
@@ -133,7 +151,7 @@ pub fn get_video_info(video_id: &str) -> Result<VideoInfo, String> {
         }
     }
 
-    // 2. Fallback: ANDROID_VR client
+    // 3. Fallback: ANDROID_VR client
     match fetch_via_android_vr(video_id) {
         Ok(info) => {
             let mut cache = get_cache().lock().unwrap();
@@ -153,7 +171,142 @@ pub fn get_video_info(video_id: &str) -> Result<VideoInfo, String> {
     }
 }
 
+fn random_string(len: usize) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let mut state = (seed ^ 0x5DEECE66D) as u64;
+    let mut out = String::with_capacity(len);
+    for _ in 0..len {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let idx = ((state >> 33) as usize) % ALPHABET.len();
+        out.push(ALPHABET[idx] as char);
+    }
+    out
+}
+
+static VISITOR_DATA: OnceLock<Mutex<Option<(String, Instant)>>> = OnceLock::new();
+
+fn get_visitor_data() -> Result<String, String> {
+    let mutex = VISITOR_DATA.get_or_init(|| Mutex::new(None));
+    {
+        let guard = mutex.lock().unwrap();
+        if let Some((ref vd, fetched_at)) = *guard {
+            if fetched_at.elapsed() < Duration::from_secs(24 * 3600) {
+                return Ok(vd.clone());
+            }
+        }
+    }
+
+    let payload = serde_json::json!({
+        "context": {
+            "client": {
+                "clientName": "VISIONOS",
+                "clientVersion": "1.02",
+                "clientScreen": "WATCH",
+                "platform": "MOBILE",
+                "deviceMake": "Apple",
+                "deviceModel": "RealityDevice14,1",
+                "osName": "visionOS",
+                "osVersion": "25.6.0.23O471",
+                "hl": "en-GB",
+                "gl": "GB",
+                "utcOffsetMinutes": 0
+            }
+        }
+    });
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(10))
+        .build();
+
+    let resp = agent
+        .post("https://www.youtube.com/youtubei/v1/visitor_id?prettyPrint=false")
+        .set("Content-Type", "application/json")
+        .set("User-Agent", "com.google.visionos.youtube/1.02(RealityDevice14,1; U; CPU visionOS 25_6_0 like Mac OS X; GB)")
+        .send_json(payload)
+        .map_err(|e| format!("Failed to fetch visitor_id: {}", e))?;
+
+    let json: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("Failed to parse visitor_id response: {}", e))?;
+
+    let vd = json["responseContext"]["visitorData"]
+        .as_str()
+        .ok_or_else(|| "visitorData missing in response".to_string())?
+        .to_string();
+
+    let mut guard = mutex.lock().unwrap();
+    *guard = Some((vd.clone(), Instant::now()));
+    Ok(vd)
+}
+
+fn fetch_via_visionos(video_id: &str) -> Result<VideoInfo, String> {
+    let visitor_data = get_visitor_data().unwrap_or_default();
+    let t_param = random_string(12);
+    let cpn = random_string(16);
+
+    let mut client = serde_json::json!({
+        "clientName": "VISIONOS",
+        "clientVersion": "1.02",
+        "clientScreen": "WATCH",
+        "platform": "MOBILE",
+        "deviceMake": "Apple",
+        "deviceModel": "RealityDevice14,1",
+        "osName": "visionOS",
+        "osVersion": "25.6.0.23O471",
+        "hl": "en-GB",
+        "gl": "GB",
+        "utcOffsetMinutes": 0
+    });
+
+    if !visitor_data.is_empty() {
+        client["visitorData"] = serde_json::Value::String(visitor_data);
+    }
+
+    let payload = serde_json::json!({
+        "context": {
+            "client": client,
+            "request": {
+                "internalExperimentFlags": [],
+                "useSsl": true
+            },
+            "user": {
+                "lockedSafetyMode": false
+            }
+        },
+        "videoId": video_id,
+        "cpn": cpn,
+        "contentCheckOk": true,
+        "racyCheckOk": true
+    });
+
+    let url = format!(
+        "https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false&t={}&id={}",
+        t_param, video_id
+    );
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(12))
+        .build();
+
+    let resp = agent
+        .post(&url)
+        .set("Content-Type", "application/json")
+        .set("User-Agent", "com.google.visionos.youtube/1.02(RealityDevice14,1; U; CPU visionOS 25_6_0 like Mac OS X; GB)")
+        .set("X-Goog-Api-Format-Version", "2")
+        .send_json(payload)
+        .map_err(|e| format!("VISIONOS player request failed: {}", e))?;
+
+    let json: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("Failed to parse VISIONOS response JSON: {}", e))?;
+
+    parse_player_response(video_id, &cpn, &json)
+}
+
 fn fetch_via_ios(video_id: &str) -> Result<VideoInfo, String> {
+    let cpn = random_string(16);
     let payload = serde_json::json!({
         "context": {
             "client": {
@@ -167,7 +320,8 @@ fn fetch_via_ios(video_id: &str) -> Result<VideoInfo, String> {
                 "gl": "US"
             }
         },
-        "videoId": video_id
+        "videoId": video_id,
+        "cpn": cpn
     });
 
     let agent = ureq::AgentBuilder::new()
@@ -186,7 +340,7 @@ fn fetch_via_ios(video_id: &str) -> Result<VideoInfo, String> {
         .into_json()
         .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
 
-    parse_player_response(video_id, &json)
+    parse_player_response(video_id, &cpn, &json)
 }
 
 fn fetch_via_android_vr(video_id: &str) -> Result<VideoInfo, String> {
@@ -217,10 +371,10 @@ fn fetch_via_android_vr(video_id: &str) -> Result<VideoInfo, String> {
         .into_json()
         .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
 
-    parse_player_response(video_id, &json)
+    parse_player_response(video_id, "", &json)
 }
 
-fn parse_player_response(video_id: &str, json: &serde_json::Value) -> Result<VideoInfo, String> {
+fn parse_player_response(video_id: &str, cpn: &str, json: &serde_json::Value) -> Result<VideoInfo, String> {
     let status = json["playabilityStatus"]["status"]
         .as_str()
         .unwrap_or("UNKNOWN");
@@ -269,6 +423,15 @@ fn parse_player_response(video_id: &str, json: &serde_json::Value) -> Result<Vid
     let fmt = selected_format.ok_or_else(|| "No direct playable audio streams found in response".to_string())?;
     let mut raw_url = fmt["url"].as_str().unwrap().to_string();
     let mime_type = fmt["mimeType"].as_str().unwrap_or("audio/webm").to_string();
+
+    // Append client playback nonce (cpn) to bypass YouTube CDN chunk throttling
+    if !cpn.is_empty() && !raw_url.contains("&cpn=") && !raw_url.contains("?cpn=") {
+        if raw_url.contains('?') {
+            raw_url.push_str(&format!("&cpn={}", cpn));
+        } else {
+            raw_url.push_str(&format!("?cpn={}", cpn));
+        }
+    }
 
     // Append extension query parameter so foobar2000's input manager instantly recognizes the format
     if mime_type.contains("webm") || mime_type.contains("opus") {
@@ -405,7 +568,7 @@ pub fn fetch_range(url: &str, start: u64, end: u64) -> Result<(Vec<u8>, u64), St
 
     let resp = agent
         .get(url)
-        .set("User-Agent", "com.google.ios.youtube/21.03.2 (iPhone16,2; U; CPU iOS 18_7_2 like Mac OS X; en_US)")
+        .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
         .set("Range", &range_header)
         .call()
         .map_err(|e| format!("HTTP Range request failed: {}", e))?;
