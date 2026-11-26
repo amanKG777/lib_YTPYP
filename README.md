@@ -388,3 +388,15 @@ This only works as long as YouTube keeps handing those app clients plain links. 
 ## Credits
 
 The idea of talking to YouTube's app API directly, instead of shelling out to yt-dlp, comes from [**FukeX**](https://github.com/amankg777/fukex), and the approach to YouTube's app clients follows ideas from **NewPipe**.
+
+---
+
+## License
+
+lib_YTPYP is free and open-source software, released under the **MIT License**. You are free to use, copy, modify and redistribute it, including in commercial projects, as long as the copyright notice and license text are kept. See [`LICENSE`](LICENSE) for the full text.
+
+Copyright © 2026 Aman Kumar Gupta.
+
+The Rust crates it depends on (`serde`, `serde_json`, `ureq` and their dependencies) are distributed under their own permissive licenses, mostly MIT and/or Apache-2.0.
+
+lib_YTPYP is not affiliated with or endorsed by YouTube or Google.
